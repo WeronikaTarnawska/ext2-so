@@ -138,7 +138,7 @@ static blk_t *blk_alloc(void) {
   if (!TAILQ_EMPTY(&lrulst)) {
 #ifdef STUDENT
     debug("blk_alloc: \tLRU\n");
-    blk = TAILQ_FIRST(&lrulst);
+    blk = TAILQ_LAST(&lrulst, blk_list);
     TAILQ_REMOVE(&lrulst, blk, b_link);
     TAILQ_REMOVE(&buckets[BUCKET(blk->b_inode, blk->b_index)], blk, b_hash);
 #endif /* !STUDENT */
@@ -213,8 +213,9 @@ int ext2_block_used(uint32_t blkaddr) {
     return EINVAL;
   int used = 0;
 #ifdef STUDENT
-  /* block addresses start from 1, 0 is a special value! */
   debug("ext2_block_used: \t---\n");
+  if (blkaddr == 0)
+    return EINVAL;
   uint32_t blkgrp = (blkaddr - 1) / blocks_per_group;
   uint32_t idx = (blkaddr - 1) % blocks_per_group;
   uint32_t bitmap_idx = group_desc[blkgrp].gd_b_bitmap;
@@ -236,7 +237,6 @@ int ext2_inode_used(uint32_t ino) {
   int used = 0;
 #ifdef STUDENT
   debug("ext2_inode_used: \t---\n");
-  /* inodes start from 1, 0 is a special value! */
   uint32_t grp = (ino - 1) / inodes_per_group;
   uint32_t idx = (ino - 1) % inodes_per_group;
   uint32_t bitmap_idx = group_desc[grp].gd_i_bitmap;
@@ -265,7 +265,7 @@ static int ext2_inode_read(off_t ino, ext2_inode_t *inode) {
   uint32_t entry_idx = idx % BLK_INODES;
   blk_t *blk = blk_get(0, inodetable_idx + blk_idx);
   ext2_inode_t *inodes = (ext2_inode_t *)blk->b_data;
-  *inode = inodes[entry_idx];
+  memcpy(inode, &inodes[entry_idx], sizeof(ext2_inode_t));
   blk_put(blk);
 #endif /* !STUDENT */
   return 0;
@@ -276,7 +276,7 @@ static uint32_t ext2_blkptr_read(uint32_t blkaddr, uint32_t blkidx) {
 #ifdef STUDENT
   debug("ext2_blkptr_read: \t---\n");
   if (!ext2_block_used(blkaddr)) {
-    return ENOENT;
+    return 0;
   }
   blk_t *blk = blk_get(0, blkaddr);
   uint32_t blkptr = ((uint32_t *)blk->b_data)[blkidx];
@@ -300,6 +300,16 @@ long ext2_blkaddr_read(uint32_t ino, uint32_t blkidx) {
     /* Read direct pointers or pointers from indirect blocks. */
 #ifdef STUDENT
   debug("ext2_blkaddr_read: \tino = %d, blkidx = %d\n", ino, blkidx);
+  debug(">>> inode to deref   : %d\n"
+        " mode                : %d\n"
+        " size                : %d\n"
+        " atime               : %d\n"
+        " nlink               : %d\n"
+        " nblock              : %d\n"
+        " blocks[0]           : %d\n"
+        " blocks[1]           : %d\n",
+        ino, inode.i_mode, inode.i_size, inode.i_atime, inode.i_nlink,
+        inode.i_nblock, inode.i_blocks[0], inode.i_blocks[1]);
   long addr = -1;
   if (blkidx < EXT2_NDADDR) {
     /* direct */
@@ -310,14 +320,16 @@ long ext2_blkaddr_read(uint32_t ino, uint32_t blkidx) {
     debug("ext2_blkaddr_read: \tsingle indirect\n");
     blkidx -= EXT2_NDADDR;
     addr = ext2_blkptr_read(inode.i_blocks[EXT2_NDADDR], blkidx);
-  } else if (false) {
+  } else if (blkidx <
+             EXT2_NDADDR + BLK_POINTERS + BLK_POINTERS * BLK_POINTERS) {
     /* double indirect: inode.i_blocks[13] */
     debug("ext2_blkaddr_read: \tdouble indirect\n");
     blkidx -= (EXT2_NDADDR + BLK_POINTERS);
     addr =
       ext2_blkptr_read(inode.i_blocks[EXT2_NDADDR + 1], blkidx / BLK_POINTERS);
     addr = ext2_blkptr_read(addr, blkidx % BLK_POINTERS);
-  } else if (false) {
+  } else if (EXT2_NDADDR +
+             ((BLK_POINTERS + 1) * BLK_POINTERS + 1) * BLK_POINTERS) {
     /* triple indirect: inode.i_blocks[14] */
     debug("ext2_blkaddr_read: \ttriple indirect\n");
     blkidx -= (EXT2_NDADDR + BLK_POINTERS + BLK_POINTERS * BLK_POINTERS);
@@ -331,10 +343,8 @@ long ext2_blkaddr_read(uint32_t ino, uint32_t blkidx) {
     panic("ext2_blkaddr_read: \tblkidx out of range!\n");
   }
   debug("ext2_blkaddr_read: \taddr = %ld\n", addr);
-  if (addr == 0)
-    panic("address = 0");
+
   return addr;
-  (void)ext2_blkptr_read;
 #endif /* !STUDENT */
   return -1;
 }
@@ -366,14 +376,15 @@ int ext2_read(uint32_t ino, void *data, size_t pos, size_t len) {
 
     if (blk == BLK_ZERO)
       memset(data, 0, tocopy);
-    else
+    else {
       memcpy(data, blk->b_data + blkoffset, tocopy);
-    blk_put(blk);
+      blk_put(blk);
+    }
     pos += tocopy;
     len -= tocopy;
     data += tocopy;
-    // debug("ext2_read: \t:)\n");
   }
+  return 0;
 #endif /* !STUDENT */
   return EINVAL;
 }
@@ -392,23 +403,25 @@ int ext2_readdir(uint32_t ino, uint32_t *off_p, ext2_dirent_t *de) {
   if (ext2_inode_read(ino, &inode))
     panic("ext2_readdir: ext2_inode_read error");
 
-  if (inode.i_size <= *off_p) {
-    debug("ext2_readdir: \treturn 0\n");
-    return 0;
-  }
-  ext2_read(ino, &de->de_ino, *off_p, 4);
-  ext2_read(ino, &de->de_reclen, *off_p + 4, 2);
-  ext2_read(ino, &de->de_namelen, *off_p + 6, 1);
-  ext2_read(ino, &de->de_type, *off_p + 7, 1);
-  ext2_read(ino, de->de_name, *off_p + 8, de->de_namelen);
-  *off_p += de->de_reclen;
+  if ((inode.i_mode & EXT2_IFDIR) != EXT2_IFDIR)
+    panic("ext2_readdir: \tnot a directory");
+
+  do {
+    if (inode.i_size <= *off_p) {
+      debug("ext2_readdir: \treturn 0\n");
+      return 0;
+    }
+    ext2_read(ino, &de->de_ino, *off_p, 4);
+    ext2_read(ino, &de->de_reclen, *off_p + 4, 2);
+    ext2_read(ino, &de->de_namelen, *off_p + 6, 1);
+    ext2_read(ino, &de->de_type, *off_p + 7, 1);
+    ext2_read(ino, de->de_name, *off_p + 8, de->de_namelen);
+    de->de_name[de->de_namelen] = '\0';
+    *off_p += de->de_reclen;
+  } while (de->de_ino == 0);
 
   debug("ext2_readdir: \t+++\n");
   return 1;
-
-  (void)ino;
-  (void)off_p;
-  (void)de;
 #endif /* !STUDENT */
   return 0;
 }
@@ -426,7 +439,7 @@ int ext2_readlink(uint32_t ino, char *buf, size_t buflen) {
     /* Check if it's a symlink and read it. */
 #ifdef STUDENT
   debug("ext2_readlink: \t---\n");
-  if (!(inode.i_mode & EXT2_IFLNK)) {
+  if ((inode.i_mode & EXT2_IFLNK) != EXT2_IFLNK) {
     return EINVAL;
   }
   if (inode.i_size > buflen) {
@@ -465,7 +478,6 @@ int ext2_stat(uint32_t ino, struct stat *st) {
   st->st_atime = inode.i_atime;
   st->st_mtime = inode.i_mtime;
   st->st_ctime = inode.i_ctime;
-
   return 0;
 #endif /* !STUDENT */
   return ENOTSUP;
@@ -490,19 +502,25 @@ int ext2_lookup(uint32_t ino, const char *name, uint32_t *ino_p,
 #ifdef STUDENT
   debug("ext2_lookup: \t---\n");
 
-  if (!(inode.i_mode && EXT2_IFDIR)) {
+  if ((inode.i_mode & EXT2_IFDIR) != EXT2_IFDIR) {
     return ENOTDIR;
   }
   if (!name || strlen(name) == 0) {
     return EINVAL;
   }
 
-  uint32_t offset;
+  uint32_t offset = 0;
   ext2_dirent_t de;
   while (ext2_readdir(ino, &offset, &de)) {
+    debug("ext2_lookup: \tsearched for name=%s, found de_name=%s\n", name,
+          de.de_name);
     if (strcmp(name, de.de_name) == 0) {
-      *ino_p = de.de_ino;
-      *type_p = de.de_type;
+      debug("ext2_lookup: \treturn: de_ino=%d, de_type=%d, for name=%s\n",
+            de.de_ino, de.de_type, name);
+      if (ino_p)
+        *ino_p = de.de_ino;
+      if (type_p)
+        *type_p = de.de_type;
       return 0;
     }
   }
